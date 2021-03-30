@@ -1,0 +1,120 @@
+###问题背景
+开发服es索引数据迁移到测试服es
+
+###部署方式(单机6.4.3版本)
+开发服version用docker部署，测试服test用k8s部署
+
+###源ES操作(version)
+1.添加共享文件到es配置文件elasticsearch.yml
+path.repo: ["/data/share"]
+
+2.重启es服务，如果是集群节点，都要这样操作
+docker restart es
+
+3.查看ES索引
+curl -X GET 'xxx.xxx.xxx.xxx:9200/_cat/indices?v'
+
+4.注册快照仓库
+curl -XPUT "xxx.xxx.xxx.xxx:9200/_snapshot/my_backup" -H 'Content-Type: application/json' -d '{"type": "fs","settings": {"location": "snap_backup","compress": true}}'
+
+5.查看注册仓库是否创建成功
+curl -XGET "xxx.xxx.xxx.xxx:9200/_snapshot/my_backup"
+
+6.创建数据快照(你需要迁移的es索引)
+curl -XPUT "xxx.xxx.xxx.xxx:9200/_snapshot/my_backup/df_back" -H 'Content-Type: application/json' -d '{"indices": "索引名称"}'
+
+7.压缩快照文件
+tar zcf es.tar.gz /data/share/*
+
+8.删除数据快照
+curl -X DELETE 'xxx.xxx.xxx.xxx:9200/_snapshot/my_backup/df_back'
+
+9.删除快照仓库
+curl -X DELETE 'xxx.xxx.xxx.xxx:9200/_snapshot/my_backup'
+
+###目标ES操作(test)
+1.添加共享文件到es配置文件elasticsearch.yml
+cluster.name: "docker-cluster"
+network.host: 0.0.0.0
+discovery.zen.minimum_master_nodes: 1
+indices.query.bool.max_clause_count: 10240
+path.repo: ["/usr/share/elasticsearch/data/share"]
+
+2.创建一个configmap
+kubectl create configmap es-config --from-file=elasticsearch.yml
+
+3.挂载到es容器中
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  name: es-pod
+spec:
+  replicas: 1
+  template: 
+    metadata:
+      labels:
+        name: es
+    spec:
+      initContainers:
+      - name: init-sysctl
+        image: busybox:1.27.2
+        imagePullPolicy: IfNotPresent
+        command:
+        - sysctl
+        - -w
+        - vm.max_map_count=262144
+        securityContext:
+          privileged: true
+      containers: 
+      - name: es-pod
+        image: elasticsearch:6.4.3
+        imagePullPolicy: IfNotPresent
+        volumeMounts:
+        - name: date-config
+          mountPath: /etc/localtime
+        - name: es-conf
+          mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
+          subPath: elasticsearch.yml
+        - name: es-data
+          mountPath: /usr/share/elasticsearch/data
+        resources:   
+          limits:
+            memory: 2000Mi
+          requests:
+            memory: 2000Mi
+        env: 
+        - name: ES_JAVA_OPTS
+          value: -Xms1024m -Xmx1024m
+        ports: 
+        - containerPort: 9200
+        - containerPort: 9300
+      volumes:
+      - name: date-config
+        hostPath: 
+          path: /etc/localtime
+      - name: es-conf
+        configMap:
+          name: es-config
+      - name: es-data
+        nfs:
+          path: NFS服务器存储ES路径
+          server: NFS服务器地址
+
+4.删除并启动ES容器
+kubectl delete -f es-deployment.yaml
+kubectl apply -f es-deployment.yaml
+
+5.注册快照仓库
+curl -XPUT "xxx.xxx.xxx.xxx:9200/_snapshot/my_backup" -H 'Content-Type: application/json' -d '{"type": "fs","settings": {"location": "snap_backup","compress": true}}'
+
+6.解压快照文件到NFS服务器存储es路径
+tar zxf es.tar.gz -C /NFS服务器存储es路径/share/
+
+7.恢复快照数据
+curl -XPOST 'xxx.xxx.xxx.xxx:9200/_snapshot/my_backup/df_back/_restore?wait_for_completion=true'
+
+8.查看ES索引是否完成数据迁移
+curl -X GET 'xxx.xxx.xxx.xxx:9200/_cat/indices?v'
+
+9.如果索引存在先删除在执行快照恢复数据
+curl -X DELETE 'xxx.xxx.xxx.xxx:9200/索引名称?pretty'
